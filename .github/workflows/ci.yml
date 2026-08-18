@@ -156,10 +156,16 @@ jobs:
       - name: Validate the production nginx config
         # deploy/nginx.prod.conf is never exercised by the compose stack below, so
         # without this a typo in it would only surface during a deploy — after the
-        # old container has already been replaced. `nginx -t` refuses to run
-        # without the certificate files, hence the throwaway self-signed pair.
+        # old container has already been replaced.
+        #
+        # Two things `nginx -t` needs that a standalone container lacks:
+        #   - the certificate files, hence the throwaway self-signed pair;
+        #   - a resolvable `api` host, because nginx resolves upstream names at
+        #     parse time and refuses to start if one does not exist. --add-host
+        #     satisfies that without altering the config being tested.
         run: |
           docker run --rm \
+            --add-host api:127.0.0.1 \
             -v "$PWD/deploy/nginx.prod.conf:/etc/nginx/nginx.conf:ro" \
             --entrypoint sh nginx:1.27-alpine -c '
               apk add --no-cache openssl >/dev/null 2>&1
