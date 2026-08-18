@@ -1,0 +1,51 @@
+# The full read path, end to end: nginx cache -> API -> Postgres.
+#
+#   docker compose up --build
+#   curl -i localhost:8080/api/v1/products?category=Running
+#
+# Hit it twice and watch X-Cache-Status go MISS then HIT.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: catalog
+      POSTGRES_PASSWORD: catalog
+      POSTGRES_DB: catalog
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The API waits on this, so it never starts against a database that is
+      # still initialising.
+      test: ['CMD-SHELL', 'pg_isready -U catalog -d catalog']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgres://catalog:catalog@postgres:5432/catalog
+      CACHE_MAX_AGE: 60
+      MAX_PAGE_SIZE: 100
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Migrate before serving. Idempotent, so restarts and scale-ups are safe.
+    command: sh -c "node dist/db/migrate.js && node dist/server.js"
+    expose:
+      - '3000'
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - '8080:80'
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
