@@ -1,0 +1,116 @@
+# Production stack for the Lightsail instance.
+#
+# Differs from the root docker-compose.yml in three ways that matter:
+#
+#   1. It pulls a prebuilt image from GHCR instead of building. A 2 GB instance
+#      running `npm ci` and `tsc` alongside Postgres is how you OOM a deploy, so
+#      the build happens in CI and the server only pulls.
+#   2. The image tag is pinned to a commit SHA, not `latest`. `latest` makes
+#      rollback guesswork and makes "what is actually running?" unanswerable.
+#   3. nginx terminates TLS and there is a certbot sidecar for renewal.
+#
+# Not run by hand — deploy/deploy.sh drives it. See README "Deployment".
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: catalog
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: catalog
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Never published to the host. Postgres is reachable only on the compose
+    # network, so the database is not exposed to the internet even if the
+    # firewall is later misconfigured.
+    expose:
+      - '5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U catalog -d catalog']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # A catalog this size fits in memory; these caps stop Postgres from
+    # ballooning and starving Node on a 2 GB box.
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+  api:
+    image: ghcr.io/${GITHUB_REPOSITORY:-ms1920/product-catalog-api}:${IMAGE_TAG:?IMAGE_TAG is required}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgres://catalog:${POSTGRES_PASSWORD}@postgres:5432/catalog
+      CACHE_MAX_AGE: ${CACHE_MAX_AGE:-60}
+      MAX_PAGE_SIZE: ${MAX_PAGE_SIZE:-100}
+      RATE_LIMIT: ${RATE_LIMIT:-600}
+      # Writes require this header in production. Unset here means an open
+      # write API on a public IP, so deploy.sh refuses to start without it.
+      API_KEY: ${API_KEY:?API_KEY is required in production}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - '3000'
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./nginx.prod.conf:/etc/nginx/nginx.conf:ro
+      # Certificates are read-only to nginx: it needs to read them, never write.
+      - certbot-conf:/etc/letsencrypt:ro
+      # Shared with certbot so HTTP-01 challenges can be served over port 80
+      # while nginx keeps running. No downtime to renew.
+      - certbot-www:/var/www/certbot:ro
+      - nginx-cache:/var/cache/nginx
+    depends_on:
+      - api
+
+  # Renewal only. The first certificate is issued by deploy/init-letsencrypt.sh,
+  # because nginx cannot start with a TLS config pointing at a cert that does not
+  # exist yet.
+  certbot:
+    image: certbot/certbot:latest
+    restart: unless-stopped
+    volumes:
+      - certbot-conf:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    # Let's Encrypt certs last 90 days. Checking twice a day is what certbot
+    # recommends: renewal only acts inside the last 30 days, and two chances a
+    # day means a transient failure is not fatal.
+    entrypoint: >
+      /bin/sh -c "trap exit TERM;
+      while :; do
+        certbot renew --webroot -w /var/www/certbot --quiet;
+        sleep 12h & wait $${!};
+      done"
+
+volumes:
+  pgdata:
+  certbot-conf:
+  certbot-www:
+  nginx-cache:

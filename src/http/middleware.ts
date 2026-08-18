@@ -116,7 +116,10 @@ export function requireApiKey(config: Config): RequestHandler {
 
     const provided = req.header('x-api-key');
     if (!provided || !timingSafeEqual(provided, config.apiKey)) {
-      return next(new AppError('Missing or invalid API key', 401, 'VALIDATION_ERROR'));
+      // UNAUTHORIZED, not VALIDATION_ERROR: the request is well-formed, the
+      // caller just is not allowed to make it. A client retrying on a 400-shaped
+      // code would never think to add credentials.
+      return next(new AppError('Missing or invalid API key', 401, 'UNAUTHORIZED'));
     }
     next();
   };

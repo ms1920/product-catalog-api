@@ -4,6 +4,8 @@ A REST service for an e-commerce product catalog: create, read, update and delet
 
 Built for the stated shape of the problem — a few hundred thousand products, reads vastly outnumbering writes, filtering and pagination as the primary access pattern.
 
+**Live: https://nike-catalog.me/api/v1/products** — deployed on every push to `main`.
+
 ```bash
 npm install
 npm start          # http://localhost:3000 — no configuration needed
@@ -36,6 +38,8 @@ docker compose up  # nginx + API + PostgreSQL, on :8080
 - [API](#api)
 - [Testing](#testing)
 - [CI/CD](#cicd)
+- [Deployment](#deployment)
+- [Why Lightsail, and what production would actually look like](#why-lightsail-and-what-production-would-actually-look-like)
 - [Tradeoffs](#tradeoffs)
 - [Future developments](#future-developments)
 
@@ -289,11 +293,24 @@ scripts/
 └── smoke.mjs                    Post-deploy checks over a real socket: header casing, 304s,
                                   412/428 preconditions, cache headers
 
-deploy/nginx.conf                Caching reverse proxy — the read-heavy requirement, applied
+deploy/
+├── nginx.conf                   Local caching reverse proxy — the read-heavy requirement,
+│                                  applied. Used by docker-compose.yml
+├── nginx.prod.conf              Production nginx: TLS, HSTS, HTTP->HTTPS, ACME challenge
+│                                  path, same caching rules. Syntax-checked in CI
+├── docker-compose.prod.yml      Server stack: pulls a SHA-pinned image from GHCR, Postgres
+│                                  never published to the host, certbot sidecar for renewal
+├── bootstrap.sh                 One-time instance setup: Docker, 2 GB swap, log caps, ufw,
+│                                  unattended upgrades
+├── init-letsencrypt.sh          Issues the first certificate, working around nginx needing
+│                                  a cert to start and certbot needing nginx to answer
+└── deploy.sh                    Runs on the server: pull, migrate, roll, wait for /ready,
+                                   auto-rollback to the previous SHA on failure
+
 Dockerfile                       Multi-stage build, production deps only, non-root, healthcheck
 docker-compose.yml               nginx + API + PostgreSQL, the whole read path locally
 .github/workflows/ci.yml         Static checks, tests, tests on real PostgreSQL, build, smoke,
-                                   Docker, and a live cache-HIT assertion
+                                   Docker with a live cache-HIT assertion, then deploy
 ```
 
 ---
@@ -389,6 +406,184 @@ Responses separate the data from the page metadata, and echo back how the query 
 
 Two of those exist because of specific failure modes. `build` asserts `dist/server.js` exists, since `tsc` exiting 0 does not prove it emitted what the Dockerfile runs. `docker` smoke-tests through nginx rather than against the API directly, because that is the only way to catch a proxy rule that swallows `/ready` or strips a header — a mistake that leaves every test green while production health checks fail.
 
+A sixth job, `deploy`, runs only on a push to `main` and only after all five pass. See below.
+
+---
+
+## Deployment
+
+Live at **https://nike-catalog.me**, on a single Amazon Lightsail instance in `ap-south-1` (Mumbai). Every push to `main` that passes CI redeploys automatically.
+
+### How a deploy works
+
+```
+push to main
+  → CI: static, tests, tests-on-real-postgres, build+smoke, docker+stack
+  → docker job pushes the tested image to ghcr.io/<repo>:<sha>
+  → deploy job: scp config → write .env → ssh → deploy.sh <sha>
+       ├─ pull the image
+       ├─ run migrations (one-off container, idempotent)
+       ├─ recreate the API container
+       ├─ poll /ready for 30s
+       └─ not ready? roll back to the previous SHA
+  → smoke test https://nike-catalog.me from the runner (read-only)
+```
+
+Three decisions in there are deliberate.
+
+**The image is built in CI, not on the server.** A 2 GB instance running `npm ci` and `tsc` next to Postgres is how a deploy gets OOM-killed. The server only pulls a prebuilt image from GHCR, so a deploy costs it almost nothing.
+
+**Images are tagged with the commit SHA, never just `latest`.** `latest` makes "what is actually running?" unanswerable and rollback a guess. A SHA tag makes rollback a matter of pointing at the previous one — no rebuild, no registry archaeology.
+
+**The image that gets pushed is the exact image that passed the stack test.** It is built once, tagged twice, tested under the local tag, and pushed under the registry tag. Rebuilding for the registry would mean shipping bytes that were never tested.
+
+**Rollback is automatic.** `deploy.sh` records the outgoing SHA before touching anything. If the new container never reports ready within 30 seconds, it restores the previous SHA, waits for that to come back, and exits non-zero. A failed deploy leaves the site up on the last known good version.
+
+**The post-deploy smoke test is read-only.** The full write lifecycle already ran against the throwaway stack in the `docker` job. Repeating it against production would leave an archived test product in the real catalog on every deploy. What the production run does verify is the part CI cannot: that DNS resolves, that the certificate is valid, that nginx is caching (`X-Cache-Status: HIT`), and that unauthenticated writes are refused.
+
+### One-time setup
+
+**1. Lightsail instance.** Mumbai `ap-south-1`, Ubuntu 22.04 or 24.04 LTS, **General purpose, 2 GB RAM / 2 vCPU / 60 GB SSD ($12/month)**.
+
+Not compute-optimized. This workload is I/O- and cache-bound, not CPU-bound: nginx answers most reads from its own cache without waking Node, and the whole table plus all seven indexes is roughly 200 MB, so it lives in RAM. Compute-optimized would cost 3.5× for CPU that idles.
+
+Then attach a **static IP** (free while attached) and open ports 80 and 443 in the Lightsail firewall. The default dynamic IP changes on stop/start, which would silently break DNS.
+
+**2. DNS at Namecheap.** Domain List → Manage → Advanced DNS. Delete the default parking records first — Namecheap ships a `CNAME www → parkingpage.namecheap.com` and a URL-redirect record that will fight your A records.
+
+| Type | Host  | Value          | TTL       |
+| ---- | ----- | -------------- | --------- |
+| A    | `@`   | your static IP | Automatic |
+| A    | `www` | your static IP | Automatic |
+
+Verify before going further, because Let's Encrypt rate-limits failures at five per hostname per hour:
+
+```bash
+dig +short nike-catalog.me
+```
+
+**3. Bootstrap the server.**
+
+```bash
+scp deploy/bootstrap.sh ubuntu@<STATIC_IP>:~
+ssh ubuntu@<STATIC_IP> 'sudo bash bootstrap.sh'
+```
+
+Installs Docker with the Compose v2 plugin, adds 2 GB of swap, caps container log size, configures `ufw`, enables unattended security upgrades, and creates `/opt/product-catalog`.
+
+The swap line is the most valuable one. On a 2 GB box running Postgres, Node and nginx, a memory spike without swap means the OOM killer — and it usually picks Postgres. Swap turns a hard failure into a slow moment. Capping log size prevents the other classic small-instance death: a full disk three weeks after a successful launch.
+
+**4. GitHub secrets.** Settings → Secrets and variables → Actions.
+
+| Secret              | Value                                     |
+| ------------------- | ----------------------------------------- |
+| `LIGHTSAIL_HOST`    | The static IP                             |
+| `LIGHTSAIL_USER`    | `ubuntu`                                  |
+| `LIGHTSAIL_SSH_KEY` | Private key contents, the whole PEM block |
+| `POSTGRES_PASSWORD` | Generate one: `openssl rand -base64 32`   |
+| `API_KEY`           | Generate one: `openssl rand -hex 32`      |
+
+`GITHUB_TOKEN` is provided automatically and is what authenticates the GHCR push and pull.
+
+Secrets are never committed. CI writes them into `/opt/product-catalog/.env` (mode 600) on every deploy, so rotating one means updating the secret and pushing — not SSHing into a box to edit a file.
+
+**5. First certificate.** Push to `main` once so the compose files land on the server, then:
+
+```bash
+ssh ubuntu@<STATIC_IP>
+cd /opt/product-catalog
+LETSENCRYPT_EMAIL=you@example.com ./init-letsencrypt.sh
+```
+
+This is a one-time bootstrap because of a chicken-and-egg problem: nginx will not start with a config pointing at a certificate that does not exist, and certbot cannot answer an HTTP-01 challenge without a web server on port 80. The script plants a self-signed placeholder, starts nginx, swaps in the real certificate, and reloads. Renewal after that is automatic — the certbot sidecar checks twice a day and nginx keeps serving throughout, because challenges are answered from a shared volume rather than by stopping the server.
+
+After that, every push to `main` deploys itself.
+
+### Operating it
+
+```bash
+ssh ubuntu@<STATIC_IP>
+cd /opt/product-catalog
+
+docker compose -f docker-compose.prod.yml ps            # what is running
+docker compose -f docker-compose.prod.yml logs -f api    # tail the API
+grep IMAGE_TAG .env                                      # which commit is live
+./deploy.sh <older-sha>                                  # manual rollback
+```
+
+Postgres is never published to the host — only `expose`, so it is reachable on the compose network and nowhere else. Even if the firewall were later misconfigured, the database is not on the internet.
+
+---
+
+## Why Lightsail, and what production would actually look like
+
+**Lightsail is chosen for cost, and that is the whole reason.** $12/month, flat, predictable, no NAT gateway billing surprises. For a portfolio deployment serving light traffic it is genuinely the right call, and pretending otherwise would be architecture theatre.
+
+It is worth being precise about what that $12 buys and what it does not:
+
+|              | Lightsail today                        | What it costs you                                     |
+| ------------ | -------------------------------------- | ----------------------------------------------------- |
+| Availability | One instance, one AZ                   | Reboot or hardware failure is downtime                |
+| Scaling      | Vertical only                          | A traffic spike needs a resize and a restart          |
+| Database     | Postgres in a container beside the app | No automated failover; backups are instance snapshots |
+| Cache        | nginx on the same box                  | Cache dies with the instance; no edge presence        |
+| Secrets      | `.env` at mode 600                     | No rotation, no audit trail                           |
+| Deploys      | Container replace, ~15s gap            | Not zero-downtime                                     |
+
+### The version I would actually run
+
+Roughly $150–250/month, which is precisely why it is not what is running today.
+
+```
+                    Route 53
+                        │
+                   CloudFront            ← edge cache; most reads never go further
+                        │
+        ┌───────────────┴────────────────┐
+        │                                │
+  ALB → ECS Fargate (2+ tasks)      S3 (product images)
+        │
+        ├── ElastiCache Redis            ← hot products by id
+        │
+        └── RDS PostgreSQL Multi-AZ
+                ├── writer
+                └── read replica(s)      ← the actual read-scaling mechanism
+```
+
+**CloudFront is the single biggest win, and the API is already built for it.** It emits `Cache-Control: public, max-age=60, stale-while-revalidate=30` and a stable ETag on every read. A CDN needs exactly those two things, so the work is done — putting CloudFront in front is configuration, not a rewrite. Reads then get absorbed at the edge, close to the user, and the origin sees a trickle.
+
+Two settings decide whether it helps or silently breaks things:
+
+- **The cache key must include the filter query parameters** (`category`, `brand`, `minPrice`, `maxPrice`, `sort`, `limit`, `cursor`, `offset`). CloudFront ignores the query string by default, which would collapse every filter combination into one cached response and serve running shoes to someone browsing basketball. This is the most common way an API behind a CDN goes wrong.
+- **Nothing carrying `X-API-Key` or `Authorization` may be cached.** Writes must reach the origin, and an authenticated response must never be served to another caller.
+
+**Read replicas are the correct answer to "faster reads" for this query pattern**, and the code is already ready for them. Reads and writes go through separate repository methods, so pointing `search` and `findById` at a replica endpoint is a change in one file. That was the point of the `Db` seam.
+
+**ECS Fargate over EC2** because there is no reason to patch an operating system to run one container. **RDS Multi-AZ** for automated failover and point-in-time recovery, which instance snapshots do not give you. **Secrets Manager** instead of a `.env` file, for rotation and an audit trail.
+
+A cheap intermediate step worth naming: **Lightsail's own CDN distribution is $2.50/month** and is CloudFront underneath. It would put the read caching at the edge without leaving Lightsail or the flat-rate pricing.
+
+### On DynamoDB, specifically
+
+The idea of DynamoDB for fast reads plus a separate store for writes, kept in sync, is a real pattern — CQRS with read models. It is worth explaining why I would not reach for it here, because the reasoning matters more than the conclusion.
+
+**DynamoDB is not a read replica.** A read replica is another copy of the same engine, kept current by the database itself, answering the same SQL. DynamoDB is a different database with a different query model. Putting it in the read path is not replication, it is maintaining a second, differently-shaped copy of the catalog — and you own the sync.
+
+**It does not fit this query shape.** The core request is `category = X AND price BETWEEN a AND b ORDER BY price`, paginated. DynamoDB can serve exactly that with a GSI keyed on `category` with `price` as the sort key — genuinely well, in fact. The trouble is everything else the brief implies. Add a brand filter, in-stock, text search, sort by name or newest, and each combination wants its own GSI. DynamoDB's `FilterExpression` is applied _after_ items are read, so you are billed for rows you then discard. Postgres evaluates the same predicates during an index range scan and never materialises them at all. Six GSIs later you have paid write capacity on every one of them for every write, and arbitrary filter combinations still are not covered.
+
+**Syncing two stores buys an eventual-consistency bug surface.** Write to Postgres, stream to DynamoDB, and a client that POSTs and immediately GETs may not see its own write. Replication lag becomes part of the API contract, and every consumer has to reason about it. That is a real cost, and it should buy something.
+
+**Here it buys nothing, because caching already solved the problem.** Reads vastly outnumber writes and a product listing tolerates 60 seconds of staleness. CloudFront plus nginx already absorb the overwhelming majority of reads before they reach the database. Adding DynamoDB solves a problem the cache has already handled while introducing a distributed-systems problem that is entirely new.
+
+**Where DynamoDB would genuinely earn its place** is workloads that are actually key-value shaped, which a filtered catalog listing is not:
+
+- Session state and shopping carts — looked up by one known key, very high rate, no range queries
+- Idempotency keys for checkout — single-key writes with a TTL, which DynamoDB does natively
+- Inventory counters — atomic increments on a hot single item, where row-level lock contention in Postgres is a real risk
+- Clickstream and view events — enormous write volume, no relational shape
+
+So the honest split is not "DynamoDB for reads, Postgres for writes". It is: **Postgres stays the source of truth** for the catalog because the query pattern is relational; **OpenSearch** becomes the query engine once filtering and text search outgrow it, fed by change-data-capture off the Postgres WAL; and **DynamoDB** takes the genuinely key-value workloads alongside them. Each store gets the work it is actually built for, and the catalog listing — the thing this service exists to serve — stays on the index that answers it in 0.68 ms.
+
 ---
 
 ## Tradeoffs
@@ -411,19 +606,29 @@ Things that are deliberately not free.
 
 **A single Postgres instance is a single point of failure.** Correct at this scale; the fix is a read replica, and the code is already replica-ready because reads and writes go through separate methods.
 
+**Everything runs on one $12 Lightsail box, so a deploy has a ~15 second gap** and an instance failure is downtime. Bought deliberately, for cost. The alternative and its price are laid out above.
+
+**Production secrets live in a `.env` file at mode 600.** No rotation, no audit trail. Secrets Manager is the right answer and costs more than the instance does.
+
 ---
 
 ## Future developments
 
 Roughly in the order the constraints would actually bite.
 
+**A CDN at the edge.** The cheapest real improvement available: a Lightsail distribution is $2.50/month, CloudFront underneath. The API already emits the `Cache-Control` and ETag headers a CDN needs, so this is configuration rather than code — provided the cache key includes the filter query parameters, which is the one setting that decides whether it works or serves the wrong category to everyone.
+
 **Read replicas.** The `Db` seam already separates reads from writes, so pointing `search` and `findById` at a replica pool is a change in one file. This is the first move when a single instance runs out of headroom, and it is the reason the seam exists.
+
+**Zero-downtime deploys.** Today the container is replaced, which leaves a ~15 second gap. Two API containers behind nginx with a drain-and-swap would close it without leaving one box.
 
 **Materialised view for facet counts,** refreshed on a schedule. Facet counts that are thirty seconds stale are almost never a problem, and it turns the 81 ms scan into an index lookup.
 
-**Elasticsearch as a search sidecar,** fed from Postgres via logical replication. Postgres stays the source of truth; ES handles typo tolerance, synonyms and learned ranking. Worth adding when search becomes a feature rather than a filter.
+**Elasticsearch or OpenSearch as a search sidecar,** fed from Postgres by change-data-capture off the WAL. Postgres stays the source of truth; the search engine handles typo tolerance, synonyms, faceting and learned ranking. Worth adding when search becomes a feature rather than a filter.
 
 **Redis for hot product reads.** nginx already caches by URL; Redis would cache by product id, which survives across different filter URLs that return the same product.
+
+**DynamoDB for the workloads that are actually key-value shaped** — carts, session state, idempotency keys, inventory counters — rather than as a second copy of the catalog. Reasoning in full above.
 
 **Cache invalidation on write.** Today freshness comes from a 60-second TTL. Purging the affected keys on write would let the TTL rise substantially, cutting origin traffic further.
 

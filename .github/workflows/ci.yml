@@ -122,17 +122,26 @@ jobs:
     name: Docker image and full stack
     runs-on: ubuntu-latest
     needs: [static, test]
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
 
+      # Built once and tagged twice: the local tag is what the stack test below
+      # runs, the registry tag is what the server pulls. Building a second time
+      # for the registry would mean shipping an image that was never tested.
       - name: Build the image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: false
           load: true
-          tags: product-catalog-api:ci
+          tags: |
+            product-catalog-api:ci
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -143,6 +152,23 @@ jobs:
           user="$(docker run --rm product-catalog-api:ci whoami)"
           echo "Container user: $user"
           test "$user" = "node"
+
+      - name: Validate the production nginx config
+        # deploy/nginx.prod.conf is never exercised by the compose stack below, so
+        # without this a typo in it would only surface during a deploy — after the
+        # old container has already been replaced. `nginx -t` refuses to run
+        # without the certificate files, hence the throwaway self-signed pair.
+        run: |
+          docker run --rm \
+            -v "$PWD/deploy/nginx.prod.conf:/etc/nginx/nginx.conf:ro" \
+            --entrypoint sh nginx:1.27-alpine -c '
+              apk add --no-cache openssl >/dev/null 2>&1
+              mkdir -p /etc/letsencrypt/live/nike-catalog.me /var/www/certbot /var/cache/nginx
+              openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
+                -keyout /etc/letsencrypt/live/nike-catalog.me/privkey.pem \
+                -out /etc/letsencrypt/live/nike-catalog.me/fullchain.pem \
+                -subj "/CN=localhost" 2>/dev/null
+              nginx -t'
 
       - name: Bring up nginx, the API and PostgreSQL
         run: docker compose up -d --build
@@ -170,3 +196,154 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose down -v
+
+      # Only publish an image that has just passed the stack test above, and only
+      # from main. A PR from a fork must never be able to push to the registry.
+      - name: Log in to GHCR
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the tested image
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          docker push "ghcr.io/${{ github.repository }}:${{ github.sha }}"
+          docker push "ghcr.io/${{ github.repository }}:latest"
+
+  # ---------------------------------------------------------------------------
+  # Continuous deployment.
+  #
+  # Gated behind every other job, so a red test cannot reach the server. The
+  # server pulls a prebuilt image and never compiles anything: `npm ci` plus tsc
+  # alongside Postgres on a 2 GB instance is how a deploy gets OOM-killed.
+  # ---------------------------------------------------------------------------
+  # Secrets cannot be read in a job-level `if`, so the check lives in a job of its
+  # own and the result gates the deploy. Without this, a fork or a clone with no
+  # server configured would show a permanently red pipeline for a deploy it was
+  # never meant to run.
+  deploy-preflight:
+    name: Is deployment configured?
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        run: |
+          missing=()
+          [[ -n "${{ secrets.LIGHTSAIL_HOST }}"    ]] || missing+=(LIGHTSAIL_HOST)
+          [[ -n "${{ secrets.LIGHTSAIL_USER }}"    ]] || missing+=(LIGHTSAIL_USER)
+          [[ -n "${{ secrets.LIGHTSAIL_SSH_KEY }}" ]] || missing+=(LIGHTSAIL_SSH_KEY)
+          [[ -n "${{ secrets.POSTGRES_PASSWORD }}" ]] || missing+=(POSTGRES_PASSWORD)
+          [[ -n "${{ secrets.API_KEY }}"           ]] || missing+=(API_KEY)
+
+          if [[ ${#missing[@]} -eq 0 ]]; then
+            echo 'configured=true' >> "$GITHUB_OUTPUT"
+            echo '::notice::Deployment is configured — proceeding.'
+          else
+            echo 'configured=false' >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping deploy. Missing secrets: ${missing[*]}. See README > Deployment."
+          fi
+
+  deploy:
+    name: Deploy to Lightsail
+    runs-on: ubuntu-latest
+    needs: [static, test, test-postgres, build, docker, deploy-preflight]
+    if: needs.deploy-preflight.outputs.configured == 'true'
+    # Lets the secrets below be scoped to production and, if you want it, gated
+    # behind a manual approval in repo settings.
+    environment:
+      name: production
+      url: https://nike-catalog.me
+    concurrency:
+      # Never let two deploys touch the box at once.
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up the SSH key
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.LIGHTSAIL_SSH_KEY }}" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          # Trust on first use. Pinning the host key in a secret is stricter and
+          # is what a hardened setup would do; keyscan is the pragmatic version
+          # and is still far better than StrictHostKeyChecking=no.
+          ssh-keyscan -H "${{ secrets.LIGHTSAIL_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Ship the deploy files
+        # Only deploy/ — the server needs the compose file, the nginx config and
+        # the scripts. It does not need the source, because it does not build.
+        run: |
+          scp -i ~/.ssh/deploy -o BatchMode=yes \
+            deploy/docker-compose.prod.yml \
+            deploy/nginx.prod.conf \
+            deploy/deploy.sh \
+            deploy/init-letsencrypt.sh \
+            "${{ secrets.LIGHTSAIL_USER }}@${{ secrets.LIGHTSAIL_HOST }}:/opt/product-catalog/"
+          ssh -i ~/.ssh/deploy -o BatchMode=yes \
+            "${{ secrets.LIGHTSAIL_USER }}@${{ secrets.LIGHTSAIL_HOST }}" \
+            'chmod +x /opt/product-catalog/*.sh'
+
+      - name: Sync configuration and secrets
+        # Written on the server rather than committed. Secrets live in GitHub,
+        # get pushed down each deploy, and never appear in the repo or the logs.
+        # `set +x` and a quoted heredoc keep them out of the run output.
+        run: |
+          set +x
+          ssh -i ~/.ssh/deploy -o BatchMode=yes \
+            "${{ secrets.LIGHTSAIL_USER }}@${{ secrets.LIGHTSAIL_HOST }}" \
+            "cat > /opt/product-catalog/.env && chmod 600 /opt/product-catalog/.env" <<EOF
+          GITHUB_REPOSITORY=${{ github.repository }}
+          IMAGE_TAG=${{ github.sha }}
+          POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+          API_KEY=${{ secrets.API_KEY }}
+          CACHE_MAX_AGE=60
+          MAX_PAGE_SIZE=100
+          RATE_LIMIT=600
+          EOF
+
+      - name: Authenticate the server to GHCR
+        run: |
+          set +x
+          ssh -i ~/.ssh/deploy -o BatchMode=yes \
+            "${{ secrets.LIGHTSAIL_USER }}@${{ secrets.LIGHTSAIL_HOST }}" \
+            "echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u ${{ github.actor }} --password-stdin"
+
+      - name: Deploy
+        # deploy.sh migrates, rolls the container, waits for readiness, and rolls
+        # back to the previous SHA if the new one never becomes ready.
+        run: |
+          ssh -i ~/.ssh/deploy -o BatchMode=yes \
+            "${{ secrets.LIGHTSAIL_USER }}@${{ secrets.LIGHTSAIL_HOST }}" \
+            "cd /opt/product-catalog && ./deploy.sh ${{ github.sha }}"
+
+      - name: Smoke test the live site over the public internet
+        # From the runner, through DNS and TLS, against the real domain. The
+        # in-container health check cannot tell you that the certificate is valid
+        # or that DNS resolves.
+        #
+        # Read-only: the full write lifecycle already ran against the throwaway
+        # stack in the `docker` job. Running it here would leave an archived test
+        # product in the real catalog on every single deploy.
+        run: npm run smoke
+        env:
+          BASE_URL: https://nike-catalog.me
+          SMOKE_READ_ONLY: 'true'
+          API_KEY: ${{ secrets.API_KEY }}
+
+      - name: Report
+        run: |
+          echo "### Deployed to production :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- URL: https://nike-catalog.me/api/v1/products" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \`ghcr.io/${{ github.repository }}:${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Revoke the key material
+        if: always()
+        run: rm -f ~/.ssh/deploy
